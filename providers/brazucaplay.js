@@ -1,34 +1,19 @@
 /**
  * BrazucaPlay - Provider Nuvio para conteúdo
- * Usando provedores globais com suporte a português
+ * Utiliza o sistema nativo GeekAntenado (Kodi) para extrair links diretos (MP4/M3U8)
+ * compatíveis com o player do Nuvio.
  */
 
 const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-  'Connection': 'keep-alive'
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+  'Connection': 'keep-alive',
+  'Accept': 'application/json, text/plain, */*'
 };
 
-const TMDB_API_KEY = 'd131017ccc6e5462a81c9304d21476de';
-const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+const TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJyZXNvbHZlciIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzc5MDk4OTczfQ.WzQBuOqMai96Afleh9g-i7NXo6h-YsjPUbOgxlUqVsU';
 
-// Novos Servidores de Embed que suportam TMDB
-const SERVERS = [
-  {
-    name: 'VidSrc',
-    url: 'https://vidsrc.me/embed/{mediaType}?tmdb={tmdbId}{seasonEpisode}',
-    language: 'Multi'
-  },
-  {
-    name: 'SmashyStream',
-    url: 'https://embed.smashystream.com/playere.php?tmdb={tmdbId}',
-    language: 'Multi'
-  },
-  {
-    name: 'AutoEmbed',
-    url: 'https://autoembed.to/{mediaType}/tmdb/{tmdbId}{seasonEpisode2}',
-    language: 'Multi'
-  }
-];
+// Cache em memória para o banco de dados (evitar múltiplos downloads de 19MB)
+let MOVIE_DB_CACHE = null;
 
 function requestRaw(method, urlString, options) {
   return fetch(urlString, {
@@ -46,84 +31,126 @@ function requestRaw(method, urlString, options) {
   });
 }
 
-function getJson(url) {
-  return requestRaw('GET', url, { headers: HEADERS }).then(function(res) {
-    try {
-      return JSON.parse(res.body);
-    } catch (e) {
-      throw new Error('Invalid JSON from GET ' + url + ': ' + e.message);
-    }
-  });
+function toBase64(str) {
+  if (typeof btoa === 'function') return btoa(str);
+  if (typeof Buffer !== 'undefined') return Buffer.from(str).toString('base64');
+  return '';
 }
 
-function fetchMovieDetails(tmdbId) {
-  var url = TMDB_BASE_URL + '/movie/' + tmdbId + '?api_key=' + TMDB_API_KEY + '&append_to_response=external_ids';
-  return getJson(url).then(function(data) {
-    return {
-      id: data.id,
-      title: data.title,
-      year: data.release_date ? data.release_date.split('-')[0] : '',
-      imdbId: (data.external_ids && data.external_ids.imdb_id) ? data.external_ids.imdb_id : '',
-      mediaType: 'movie'
-    };
-  });
+function fromBase64(str) {
+  if (typeof atob === 'function') return atob(str);
+  if (typeof Buffer !== 'undefined') return Buffer.from(str, 'base64').toString('utf-8');
+  return '';
 }
 
-function fetchTvDetails(tmdbId) {
-  var url = TMDB_BASE_URL + '/tv/' + tmdbId + '?api_key=' + TMDB_API_KEY + '&append_to_response=external_ids';
-  return getJson(url).then(function(data) {
-    return {
-      id: data.id,
-      title: data.name,
-      year: data.first_air_date ? data.first_air_date.split('-')[0] : '',
-      imdbId: (data.external_ids && data.external_ids.imdb_id) ? data.external_ids.imdb_id : '',
-      mediaType: 'tv'
-    };
-  });
-}
-
-function fetchMediaDetails(tmdbId, mediaType) {
-  if (mediaType === 'movie') return fetchMovieDetails(tmdbId);
-  if (mediaType === 'tv') return fetchTvDetails(tmdbId);
-  return fetchMovieDetails(tmdbId).catch(function() { return fetchTvDetails(tmdbId); });
-}
-
-function formatServerUrl(server, mediaDetails, seasonNum, episodeNum) {
-  var url = server.url
-    .replace('{mediaType}', mediaDetails.mediaType)
-    .replace('{tmdbId}', mediaDetails.id);
+function getGeekAntenadoData(params) {
+  // Transforma o JSON params em string -> base64 -> url encoded
+  const jsonStr = JSON.stringify(params).replace(/"/g, "'"); // o Python deles as vezes espera aspas simples
+  const payload = encodeURIComponent(toBase64(jsonStr));
+  const url = 'https://api.geekantenado.online/?resolver=' + payload;
   
-  if (mediaDetails.mediaType === 'tv' && seasonNum && episodeNum) {
-    url = url.replace('{seasonEpisode}', '&season=' + seasonNum + '&episode=' + episodeNum);
-    url = url.replace('{seasonEpisode2}', '-' + seasonNum + '-' + episodeNum);
-  } else {
-    url = url.replace('{seasonEpisode}', '');
-    url = url.replace('{seasonEpisode2}', '');
-  }
-  return url;
+  return requestRaw('GET', url, {
+    headers: {
+      'Authorization': 'Bearer ' + TOKEN,
+      'User-Agent': HEADERS['User-Agent'],
+      'Accept': HEADERS['Accept']
+    }
+  }).then(function(res) {
+    try {
+      const data = JSON.parse(res.body);
+      if (data && data.success && data.result && data.result !== 'episode not found!') {
+         return fromBase64(data.result);
+      }
+    } catch(e) {
+      // Ignorar erros de parse
+    }
+    return null;
+  });
 }
 
-function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
-  return new Promise(function(resolve) {
-    fetchMediaDetails(tmdbId, mediaType)
-      .then(function(mediaDetails) {
-        var streams = [];
-        SERVERS.forEach(function(server) {
-          var embedUrl = formatServerUrl(server, mediaDetails, seasonNum, episodeNum);
-          streams.push({
-            name: 'BrazucaPlay ' + server.name + ' (' + server.language + ')',
-            title: mediaDetails.title + ' (' + mediaDetails.year + ')',
-            url: embedUrl,
-            quality: 'Auto',
-            size: 'Unknown',
-            headers: HEADERS,
-            provider: 'brazucaplay'
-          });
-        });
-        resolve(streams);
-      })
-      .catch(function() { resolve([]); });
-  });
+async function getMovieDb() {
+  if (MOVIE_DB_CACHE) return MOVIE_DB_CACHE;
+  
+  let lancamentosBody = '';
+  let pageBody = '';
+  
+  try {
+    const lancamentos = await requestRaw('GET', 'https://gist.githubusercontent.com/skyrisk/5b87797329c7b46422565ffbaab3be7e/raw/lancamentos.xml');
+    lancamentosBody = lancamentos.body;
+  } catch (e) {}
+
+  try {
+    const pageXml = await requestRaw('GET', 'https://gist.githubusercontent.com/skyrisk/5b87797329c7b46422565ffbaab3be7e/raw/page.xml');
+    pageBody = pageXml.body;
+  } catch (e) {}
+  
+  MOVIE_DB_CACHE = lancamentosBody + '\n' + pageBody;
+  return MOVIE_DB_CACHE;
+}
+
+function extractResolverSlugs(xmlContent, tmdbId) {
+  // Regex segura que não avança para o próximo <item>
+  const regexStr = '<item>(?:(?!<\\/item>)[\\s\\S])*?<tmdb_id>' + tmdbId + '<\\/tmdb_id>(?:(?!<\\/item>)[\\s\\S])*?<\\/item>';
+  const regex = new RegExp(regexStr, 'i');
+  const match = xmlContent.match(regex);
+  if (!match) return null;
+
+  const itemBlock = match[0];
+  const linkMatch = itemBlock.match(/<link>(.*?)<\/link>/i);
+  if (!linkMatch) return null;
+  const linkData = linkMatch[1];
+  
+  // Pegamos as resoluções do GeekAntenado ignorando providers mortos como videasy/movie2
+  const resolvers = [];
+  const resolverRegex = /resolver(\d+)_(mv|tvshows|episodes)=([^|<]+)/gi;
+  let m;
+  while ((m = resolverRegex.exec(linkData)) !== null) {
+      resolvers.push({
+          id: parseInt(m[1], 10),
+          type: m[2],
+          slug: m[3]
+      });
+  }
+  return resolvers;
+}
+
+async function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
+  try {
+    const streams = [];
+    if (mediaType === 'movie') {
+      const xml = await getMovieDb();
+      const resolvers = extractResolverSlugs(xml, tmdbId);
+      
+      if (resolvers && resolvers.length > 0) {
+        for (let r of resolvers) {
+          // Ex: { 'resolver': 3, 'request': 'mvshows=cara-de-um-focinho-de-outro' }
+          const params = { resolver: r.id, request: `mvshows=${r.slug}` };
+          const directUrl = await getGeekAntenadoData(params).catch(() => null);
+          
+          if (directUrl && (directUrl.includes('.mp4') || directUrl.includes('.m3u8') || directUrl.startsWith('http'))) {
+            streams.push({
+              name: 'BrazucaPlay',
+              title: 'Servidor ' + r.id + ' (Direto)',
+              url: directUrl,
+              quality: directUrl.includes('FHD') ? '1080p' : (directUrl.includes('HD') ? '720p' : 'Auto'),
+              size: 'Unknown',
+              headers: HEADERS,
+              provider: 'brazucaplay'
+            });
+          }
+        }
+      }
+    } else {
+        // Implementação de séries requereria parsing do SeriesBase e duas chamadas de API.
+        // Foco inicial em filmes para sanar o Player Error
+        return [];
+    }
+    
+    return streams;
+  } catch (e) {
+    console.error('BrazucaPlay Error: ', e);
+    return [];
+  }
 }
 
 if (typeof module !== 'undefined' && module.exports) {
